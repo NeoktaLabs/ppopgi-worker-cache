@@ -1,5 +1,5 @@
 {
-  "name": "subgraph-cache-worker",
+  "name": "ppopgi-worker-cache",
   "private": true,
   "type": "module",
   "devDependencies": {
