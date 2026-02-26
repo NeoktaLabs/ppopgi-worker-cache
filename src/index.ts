@@ -26,7 +26,8 @@ const META_FETCH_TIMEOUT_MS = 8000;
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      if (req.method === "OPTIONS") return handleOptions();
+      // ✅ FIX: pass request to OPTIONS handler (dynamic allow-headers)
+      if (req.method === "OPTIONS") return handleOptions(req);
 
       const url = new URL(req.url);
 
@@ -329,12 +330,18 @@ function withCors(res: Response) {
   return new Response(r.body, { status: r.status, headers });
 }
 
-function handleOptions() {
+// ✅ FIX: dynamically echo requested headers/method for preflight robustness
+function handleOptions(req: Request) {
   const headers = new Headers();
+
+  const reqHeaders = req.headers.get("Access-Control-Request-Headers") || "content-type";
+  const reqMethod = req.headers.get("Access-Control-Request-Method") || "POST";
+
   headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
-  headers.set("Access-Control-Allow-Headers", "Content-Type, X-Force-Fresh");
+  headers.set("Access-Control-Allow-Methods", `POST, OPTIONS, GET, ${reqMethod}`);
+  headers.set("Access-Control-Allow-Headers", reqHeaders);
   headers.set("Access-Control-Max-Age", "86400");
+
   return new Response(null, { status: 204, headers });
 }
 
@@ -462,11 +469,7 @@ async function fetchSubgraphMetaBlock(env: Env): Promise<number | null> {
   }
 }
 
-async function shouldWriteThroughCacheMetaGuard(
-  env: Env,
-  cache: Cache,
-  hashKey: string
-): Promise<boolean> {
+async function shouldWriteThroughCacheMetaGuard(env: Env, cache: Cache, hashKey: string): Promise<boolean> {
   // If we cannot reliably compare meta, default to "do not write-through" (safe).
   const newMeta = await fetchSubgraphMetaBlock(env);
   if (newMeta == null) return false;
@@ -495,7 +498,11 @@ async function shouldWriteThroughCacheMetaGuard(
     const cc = cacheControlMeta(META_CACHE_TTL_SECONDS);
     const toStore = new Response(String(newMeta), {
       status: 200,
-      headers: { "content-type": "text/plain; charset=utf-8", "Cache-Control": cc, "CDN-Cache-Control": cc },
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "Cache-Control": cc,
+        "CDN-Cache-Control": cc,
+      },
     });
     // fire and forget is fine; caller can write-through regardless
     await cache.put(metaReq, toStore);
