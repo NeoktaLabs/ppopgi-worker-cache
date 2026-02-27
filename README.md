@@ -1,3 +1,5 @@
+# Ppopgi (뽑기) Cache Worker
+
 Ppopgi Cache Worker is a lightweight background service designed to improve frontend performance and data freshness by caching frequently accessed protocol data derived from the subgraph and on-chain sources.
 
 The worker periodically aggregates and normalizes lottery metadata such as status, prize pools, ticket counts, deadlines, participants and recent activity. This processed data is stored in a fast cache layer that the frontend can query with minimal latency.
