@@ -8,4 +8,4 @@ enabled = true
 invocation_logs = true
 
 [vars]
-SUBGRAPH_URL = "https://api.studio.thegraph.com/query/XXXX/ppopgi/version/latest"
+SUBGRAPH_URL = "https://gateway.thegraph.com/api/579d8d8b8c5dd61ebdbcd02c7224d44e/subgraphs/id/Gr1f8SimJE5CwrWt23HzYdS23NqznHbrEPf3BM4h9rXn"
