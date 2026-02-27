@@ -6,3 +6,6 @@ compatibility_date = "2025-01-01"
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+[vars]
+SUBGRAPH_URL = "https://api.studio.thegraph.com/query/XXXX/ppopgi/version/latest"
