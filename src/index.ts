@@ -3,7 +3,8 @@ export interface Env {
   SUBGRAPH_URL: string;
 }
 
-const DEFAULT_TTL_SECONDS = 5;
+// ✅ bump default TTL (more cache hits, less indexer load)
+const DEFAULT_TTL_SECONDS = 8;
 
 /**
  * Store in-flight results as plain data (NOT Response),
@@ -252,30 +253,17 @@ export default {
 
 // -------------------- Cache-Control helpers --------------------
 
-/**
- * Edge-cache only:
- * - Browser: max-age=0 (always revalidate; avoids device "stickiness")
- * - Edge/shared: s-maxage=ttl (Cloudflare cache stays hot)
- * - SWR: allow instant responses while edge refreshes
- */
 function cacheControlEdgeOnly(ttl: number) {
   return `public, max-age=0, s-maxage=${ttl}, stale-while-revalidate=${ttl}`;
 }
 
-// Meta-guard cache control (edge cache for a longer time; still no browser cache)
 function cacheControlMeta(ttl: number) {
   return `public, max-age=0, s-maxage=${ttl}, stale-while-revalidate=${Math.min(30, ttl)}`;
 }
 
 // -------------------- Response builders (NO stream reuse) --------------------
 
-type XCache =
-  | "HIT"
-  | "MISS"
-  | "COALESCED"
-  | "BYPASS"
-  | "COALESCED_BYPASS"
-  | "BYPASS_WRITE";
+type XCache = "HIT" | "MISS" | "COALESCED" | "BYPASS" | "COALESCED_BYPASS" | "BYPASS_WRITE";
 
 function makeTextResponse(v: InflightValue, ttl: number, xCache: XCache): Response {
   const cc = cacheControlEdgeOnly(ttl);
@@ -291,9 +279,6 @@ function makeTextResponse(v: InflightValue, ttl: number, xCache: XCache): Respon
   });
 }
 
-/**
- * Clone response & add headers (safe even if body was consumed elsewhere).
- */
 function addHeaders(res: Response, extra: Record<string, string>): Response {
   const r = res.clone();
   const headers = new Headers(r.headers);
@@ -303,10 +288,6 @@ function addHeaders(res: Response, extra: Record<string, string>): Response {
 
 // -------------------- CORS --------------------
 
-/**
- * ✅ Always wildcard CORS to avoid cached responses being tied to a single Origin.
- * This worker does not use credentials/cookies, so '*' is correct and safest.
- */
 function withCors(res: Response) {
   const r = res.clone();
   const headers = new Headers(r.headers);
@@ -315,7 +296,6 @@ function withCors(res: Response) {
   headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   headers.set("Access-Control-Allow-Headers", "Content-Type, X-Force-Fresh");
 
-  // If upstream set Vary, keep it, but never vary on Origin (wildcard)
   const vary = headers.get("Vary");
   if (vary && vary.toLowerCase().includes("origin")) {
     const cleaned = vary
@@ -330,7 +310,6 @@ function withCors(res: Response) {
   return new Response(r.body, { status: r.status, headers });
 }
 
-// ✅ FIX: dynamically echo requested headers/method for preflight robustness
 function handleOptions(req: Request) {
   const headers = new Headers();
 
@@ -354,11 +333,9 @@ function clampPagination(variables: any) {
     for (const k of Object.keys(obj)) {
       const v = obj[k];
 
-      // Conservative defaults
       if (k === "first") obj[k] = clampNumberish(v, 1, 200);
       if (k === "skip") obj[k] = clampNumberish(v, 0, 100_000);
 
-      // Clamp common array vars (ids)
       if ((k === "ids" || k.endsWith("Ids")) && Array.isArray(v)) obj[k] = v.slice(0, 200);
 
       walk(v);
@@ -382,15 +359,29 @@ function clampInt(n: number, min: number, max: number) {
   return Math.min(Math.max(Math.trunc(n), min), max);
 }
 
+/**
+ * ✅ TTL routing based on your REAL frontend operation names.
+ * We look for "query <OperationName>" to avoid accidental matches.
+ */
 function pickTtlSeconds(query: string): number {
   const q = query.toLowerCase();
 
-  // "hot" / fast-moving queries
-  if (q.includes("globalfeed") || q.includes("raffleevents")) return 3;
-  if (q.includes("_meta") || q.includes("__meta")) return 3;
+  // hot / meta
+  if (q.includes("query globalfeed")) return 3;
+  if (q.includes("_meta") || q.includes("query __meta")) return 3;
 
-  // Slightly longer for "stable" reads (details by id, participants, etc.)
-  if (q.includes("rafflebyid") || q.includes("raffle(") || q.includes("raffleparticipants")) return 10;
+  // homepage / billboard
+  if (q.includes("query globalstats") || q.includes("query globalstatsbillboard")) return 8;
+  if (q.includes("query homelotteries")) return 8;
+
+  // detail / user pages
+  if (q.includes("query lotterybyid")) return 15;
+  if (q.includes("query userlotteriesbyuser")) return 15;
+  if (q.includes("query userlotteriesbylottery")) return 15;
+
+  // filtered lists
+  if (q.includes("query lotteriesbycreator")) return 20;
+  if (q.includes("query lotteriesbyfeerecipient")) return 20;
 
   return DEFAULT_TTL_SECONDS;
 }
@@ -470,13 +461,10 @@ async function fetchSubgraphMetaBlock(env: Env): Promise<number | null> {
 }
 
 async function shouldWriteThroughCacheMetaGuard(env: Env, cache: Cache, hashKey: string): Promise<boolean> {
-  // If we cannot reliably compare meta, default to "do not write-through" (safe).
   const newMeta = await fetchSubgraphMetaBlock(env);
   if (newMeta == null) return false;
 
-  const metaReq = metaKeyUrlFrom("https://example.invalid/graphql", hashKey); // origin irrelevant; key is full URL
-  // NOTE: we use a stable synthetic origin; Cloudflare Cache API keys are URL-based.
-  // Using a fixed origin prevents accidental key fragmentation.
+  const metaReq = metaKeyUrlFrom("https://example.invalid/graphql", hashKey);
 
   let oldMeta: number | null = null;
   try {
@@ -487,13 +475,11 @@ async function shouldWriteThroughCacheMetaGuard(env: Env, cache: Cache, hashKey:
       if (Number.isFinite(n)) oldMeta = n;
     }
   } catch {
-    // ignore; treat as missing
+    // ignore
   }
 
-  // Only allow write-through if meta advanced (or first time).
   if (oldMeta != null && newMeta < oldMeta) return false;
 
-  // Update stored meta (best effort)
   try {
     const cc = cacheControlMeta(META_CACHE_TTL_SECONDS);
     const toStore = new Response(String(newMeta), {
@@ -504,7 +490,6 @@ async function shouldWriteThroughCacheMetaGuard(env: Env, cache: Cache, hashKey:
         "CDN-Cache-Control": cc,
       },
     });
-    // fire and forget is fine; caller can write-through regardless
     await cache.put(metaReq, toStore);
   } catch {
     // ignore
