@@ -38,15 +38,38 @@ export default {
       }
 
       // Dedicated meta endpoint (simple + reliable)
+      // ✅ UPDATE #1: Use Workers Cache API for deterministic edge caching (not just Cache-Control headers)
       if (url.pathname === "/meta") {
         if (!env.SUBGRAPH_URL) {
           return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }));
         }
 
-        // IMPORTANT: edge-cache only, never browser-cache
         const ttl = 3;
         const cc = cacheControlEdgeOnly(ttl);
 
+        // Cache API key: stable synthetic GET
+        const cacheUrl = new URL(req.url);
+        cacheUrl.pathname = `/__cache/meta`; // single shared meta cache key
+        cacheUrl.search = "";
+        const cacheReq = new Request(cacheUrl.toString(), { method: "GET" });
+        const cache = caches.default;
+
+        // Cache hit
+        try {
+          const cached = await cache.match(cacheReq);
+          if (cached) {
+            const hit = addHeaders(cached, {
+              "Cache-Control": cc,
+              "CDN-Cache-Control": cc,
+              "X-Cache": "HIT",
+            });
+            return withCors(hit);
+          }
+        } catch (e) {
+          console.error("cache.match(/meta) failed", e);
+        }
+
+        // Cache miss
         try {
           const upstream = await fetchWithTimeout(
             env.SUBGRAPH_URL,
@@ -74,6 +97,21 @@ export default {
               "X-Cache": "MISS",
             },
           });
+
+          // Only cache OK responses (and avoid caching GraphQL "errors" payloads)
+          let okToCache = upstream.ok;
+          if (okToCache && ct.includes("application/json")) {
+            try {
+              const parsed = JSON.parse(text);
+              if (parsed && typeof parsed === "object" && "errors" in parsed) okToCache = false;
+            } catch {
+              okToCache = false;
+            }
+          }
+
+          if (okToCache) {
+            ctx.waitUntil(cache.put(cacheReq, res.clone()).catch((e) => console.error("cache.put(/meta) failed", e)));
+          }
 
           return withCors(res);
         } catch (e) {
