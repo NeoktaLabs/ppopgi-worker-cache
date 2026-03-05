@@ -3,8 +3,17 @@ export interface Env {
   SUBGRAPH_URL: string;
 }
 
+/**
+ * ✅ Updated based on your HAR + your “no operationName in payload” reality:
+ * - Increase TTLs so your idle polling (~15–20s) produces mostly HITs.
+ * - Make TTL routing robust by matching operation names anywhere in the query
+ *   (not only "query <Name>" which can fail with newlines/formatting).
+ *
+ * No frontend changes required.
+ */
+
 // ✅ bump default TTL (more cache hits, less indexer load)
-const DEFAULT_TTL_SECONDS = 8;
+const DEFAULT_TTL_SECONDS = 20;
 
 /**
  * Store in-flight results as plain data (NOT Response),
@@ -161,7 +170,7 @@ export default {
       // Cache key from query+variables (canonical)
       const hashKey = await sha256Hex(
         canonicalStringify({
-          v: 7, // bump version due to force-fresh/meta-guard behavior
+          v: 8, // bump version because TTL routing behavior changed (helps avoid mixing old cache policy)
           query,
           variables,
         })
@@ -399,27 +408,35 @@ function clampInt(n: number, min: number, max: number) {
 
 /**
  * ✅ TTL routing based on your REAL frontend operation names.
- * We look for "query <OperationName>" to avoid accidental matches.
+ *
+ * Since your frontend does not send `operationName`, we match by looking for the operation
+ * name anywhere in the query string (robust to whitespace/newlines/minification).
+ *
+ * TTLs tuned for your observed idle polling:
+ * - HomeLotteries + GlobalStatsBillboard were called every ~15–20s while idle.
+ *   Old TTL=8s caused mostly MISS.
+ *   New TTL=30s makes those mostly HIT per PoP.
  */
 function pickTtlSeconds(query: string): number {
   const q = query.toLowerCase();
 
   // hot / meta
-  if (q.includes("query globalfeed")) return 3;
-  if (q.includes("_meta") || q.includes("query __meta")) return 3;
+  // Keep global feed pretty fresh; force-fresh exists for txs anyway.
+  if (q.includes("globalfeed")) return 5;
+  if (q.includes("_meta") || q.includes("__meta")) return 3;
 
-  // homepage / billboard
-  if (q.includes("query globalstats") || q.includes("query globalstatsbillboard")) return 8;
-  if (q.includes("query homelotteries")) return 8;
+  // homepage / billboard (idle spam culprits)
+  if (q.includes("globalstatsbillboard") || q.includes("globalstats")) return 30;
+  if (q.includes("homelotteries")) return 30;
 
   // detail / user pages
-  if (q.includes("query lotterybyid")) return 15;
-  if (q.includes("query userlotteriesbyuser")) return 15;
-  if (q.includes("query userlotteriesbylottery")) return 15;
+  if (q.includes("lotterybyid")) return 25;
+  if (q.includes("userlotteriesbyuser")) return 25;
+  if (q.includes("userlotteriesbylottery")) return 25;
 
-  // filtered lists
-  if (q.includes("query lotteriesbycreator")) return 20;
-  if (q.includes("query lotteriesbyfeerecipient")) return 20;
+  // filtered lists (less frequent; longer TTL helps load)
+  if (q.includes("lotteriesbycreator")) return 45;
+  if (q.includes("lotteriesbyfeerecipient")) return 45;
 
   return DEFAULT_TTL_SECONDS;
 }
