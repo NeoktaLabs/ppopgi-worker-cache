@@ -53,7 +53,7 @@ export default {
           return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }));
         }
 
-        const ttl = 3;
+        const ttl = 60;
         const cc = cacheControlEdgeOnly(ttl);
 
         // Cache API key: stable synthetic GET
@@ -422,8 +422,8 @@ function pickTtlSeconds(query: string): number {
 
   // hot / meta
   // Keep global feed pretty fresh; force-fresh exists for txs anyway.
-  if (q.includes("globalfeed")) return 5;
-  if (q.includes("_meta") || q.includes("__meta")) return 3;
+  if (q.includes("globalfeed")) return 15;
+  if (q.includes("_meta") || q.includes("__meta")) return 60;
 
   // homepage / billboard (idle spam culprits)
   if (q.includes("globalstatsbillboard") || q.includes("globalstats")) return 30;
