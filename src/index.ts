@@ -8,8 +8,6 @@ export interface Env {
  * - Increase TTLs so your idle polling (~15–20s) produces mostly HITs.
  * - Make TTL routing robust by matching operation names anywhere in the query
  *   (not only "query <Name>" which can fail with newlines/formatting).
- *
- * No frontend changes required.
  */
 
 // ✅ bump default TTL (more cache hits, less indexer load)
