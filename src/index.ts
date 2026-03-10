@@ -4,13 +4,17 @@ export interface Env {
 }
 
 /**
- * ✅ Updated based on your HAR + your “no operationName in payload” reality:
- * - Increase TTLs so your idle polling (~15–20s) produces mostly HITs.
- * - Make TTL routing robust by matching operation names anywhere in the query
- *   (not only "query <Name>" which can fail with newlines/formatting).
+ * Goals:
+ * - Keep passive-view freshness bounded (~15–30s depending on query class).
+ * - Protect the subgraph from many concurrent readers.
+ * - Allow post-tx "force fresh" reads to bypass cache safely.
+ *
+ * Important fix in this revision:
+ * - NORMAL and FORCE_FRESH requests now use separate in-flight lanes.
+ *   A force-fresh request will no longer coalesce onto an older normal fetch.
  */
 
-// ✅ bump default TTL (more cache hits, less indexer load)
+// Default TTL
 const DEFAULT_TTL_SECONDS = 20;
 
 /**
@@ -24,6 +28,14 @@ type InflightValue = {
   ok: boolean;
 };
 
+/**
+ * IMPORTANT:
+ * We key inflight by "lane:hash".
+ * - normal:<hash>
+ * - force:<hash>
+ *
+ * This prevents a force-fresh request from attaching to a normal in-flight fetch.
+ */
 const inflight = new Map<string, Promise<InflightValue>>();
 
 // --- Force-fresh + meta-guard config ---
@@ -34,7 +46,6 @@ const META_FETCH_TIMEOUT_MS = 8000;
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      // ✅ FIX: pass request to OPTIONS handler (dynamic allow-headers)
       if (req.method === "OPTIONS") return handleOptions(req);
 
       const url = new URL(req.url);
@@ -44,8 +55,7 @@ export default {
         return withCors(new Response("ok", { status: 200 }));
       }
 
-      // Dedicated meta endpoint (simple + reliable)
-      // ✅ UPDATE #1: Use Workers Cache API for deterministic edge caching (not just Cache-Control headers)
+      // Dedicated meta endpoint
       if (url.pathname === "/meta") {
         if (!env.SUBGRAPH_URL) {
           return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }));
@@ -54,14 +64,12 @@ export default {
         const ttl = 60;
         const cc = cacheControlEdgeOnly(ttl);
 
-        // Cache API key: stable synthetic GET
         const cacheUrl = new URL(req.url);
-        cacheUrl.pathname = `/__cache/meta`; // single shared meta cache key
+        cacheUrl.pathname = `/__cache/meta`;
         cacheUrl.search = "";
         const cacheReq = new Request(cacheUrl.toString(), { method: "GET" });
         const cache = caches.default;
 
-        // Cache hit
         try {
           const cached = await cache.match(cacheReq);
           if (cached) {
@@ -76,7 +84,6 @@ export default {
           console.error("cache.match(/meta) failed", e);
         }
 
-        // Cache miss
         try {
           const upstream = await fetchWithTimeout(
             env.SUBGRAPH_URL,
@@ -105,7 +112,6 @@ export default {
             },
           });
 
-          // Only cache OK responses (and avoid caching GraphQL "errors" payloads)
           let okToCache = upstream.ok;
           if (okToCache && ct.includes("application/json")) {
             try {
@@ -159,7 +165,7 @@ export default {
       if (!query) return withCors(new Response("Missing query", { status: 400 }));
       if (query.length > 60_000) return withCors(new Response("Query too large", { status: 413 }));
 
-      // Clamp to protect indexer
+      // Clamp to protect subgraph
       clampPagination(variables);
 
       const ttl = pickTtlSeconds(query);
@@ -168,14 +174,13 @@ export default {
       // Cache key from query+variables (canonical)
       const hashKey = await sha256Hex(
         canonicalStringify({
-          v: 8, // bump version because TTL routing behavior changed (helps avoid mixing old cache policy)
+          v: 9, // bumped because in-flight behavior changed
           query,
           variables,
         })
       );
 
-      // Cache API uses Request as key; we make a synthetic GET
-      // IMPORTANT: ignore incoming querystring entirely to allow frontend ?cb=... without busting edge cache
+      // Edge cache key
       const cacheUrl = new URL(req.url);
       cacheUrl.pathname = `/__cache/${hashKey}`;
       cacheUrl.search = "";
@@ -183,7 +188,7 @@ export default {
 
       const cache = caches.default;
 
-      // Cache match (guarded) — skip if force-fresh
+      // Normal reads can use edge cache. Force-fresh bypasses it.
       if (!forceFresh) {
         try {
           const cached = await cache.match(cacheReq);
@@ -200,8 +205,12 @@ export default {
         }
       }
 
-      // ✅ In-flight dedupe (still dedupes even for force-fresh to avoid stampedes)
-      const existing = inflight.get(hashKey);
+      /**
+       * IMPORTANT:
+       * Use separate in-flight lanes so force-fresh does not join normal traffic.
+       */
+      const inflightKey = `${forceFresh ? "force" : "normal"}:${hashKey}`;
+      const existing = inflight.get(inflightKey);
       if (existing) {
         const v = await existing;
         const res = makeTextResponse(v, ttl, forceFresh ? "COALESCED_BYPASS" : "COALESCED");
@@ -230,7 +239,6 @@ export default {
             ok: upstream.ok,
           };
 
-          // Cache only ok responses (and avoid caching GraphQL "errors" payloads)
           let okToCache = v.ok;
           if (okToCache && ct.includes("application/json")) {
             try {
@@ -242,14 +250,12 @@ export default {
           }
 
           /**
-           * ✅ Meta-guard to avoid cache poisoning:
-           * - We *may* bypass cache on force-fresh reads.
-           * - But we should only write-through if the subgraph has advanced (by _meta.block.number)
-           *   relative to what we last cached for this query key.
+           * Meta-guard to avoid cache poisoning on force-fresh:
+           * - normal path: write-through as before
+           * - force-fresh path: only write-through if subgraph _meta advanced
            */
           if (okToCache) {
             if (forceFresh) {
-              // only write-through if meta advanced (best-effort). If meta fetch fails, do NOT write-through.
               const shouldWrite = await shouldWriteThroughCacheMetaGuard(env, cache, hashKey);
               if (shouldWrite) {
                 const toCache = makeTextResponse(v, ttl, "BYPASS_WRITE");
@@ -274,10 +280,10 @@ export default {
           };
         }
       })().finally(() => {
-        inflight.delete(hashKey);
+        inflight.delete(inflightKey);
       });
 
-      inflight.set(hashKey, p);
+      inflight.set(inflightKey, p);
 
       const v = await p;
       const res = makeTextResponse(v, ttl, forceFresh ? "BYPASS" : "MISS");
@@ -306,7 +312,7 @@ function cacheControlMeta(ttl: number) {
   return `public, max-age=0, s-maxage=${ttl}, stale-while-revalidate=${Math.min(30, ttl)}`;
 }
 
-// -------------------- Response builders (NO stream reuse) --------------------
+// -------------------- Response builders --------------------
 
 type XCache = "HIT" | "MISS" | "COALESCED" | "BYPASS" | "COALESCED_BYPASS" | "BYPASS_WRITE";
 
@@ -405,34 +411,22 @@ function clampInt(n: number, min: number, max: number) {
 }
 
 /**
- * ✅ TTL routing based on your REAL frontend operation names.
- *
- * Since your frontend does not send `operationName`, we match by looking for the operation
- * name anywhere in the query string (robust to whitespace/newlines/minification).
- *
- * TTLs tuned for your observed idle polling:
- * - HomeLotteries + GlobalStatsBillboard were called every ~15–20s while idle.
- *   Old TTL=8s caused mostly MISS.
- *   New TTL=30s makes those mostly HIT per PoP.
+ * TTL routing by query contents.
+ * Later, this is worth replacing with explicit cache-group headers.
  */
 function pickTtlSeconds(query: string): number {
   const q = query.toLowerCase();
 
-  // hot / meta
-  // Keep global feed pretty fresh; force-fresh exists for txs anyway.
   if (q.includes("globalfeed")) return 15;
   if (q.includes("_meta") || q.includes("__meta")) return 60;
 
-  // homepage / billboard (idle spam culprits)
   if (q.includes("globalstatsbillboard") || q.includes("globalstats")) return 30;
   if (q.includes("homelotteries")) return 30;
 
-  // detail / user pages
   if (q.includes("lotterybyid")) return 25;
   if (q.includes("userlotteriesbyuser")) return 25;
   if (q.includes("userlotteriesbylottery")) return 25;
 
-  // filtered lists (less frequent; longer TTL helps load)
   if (q.includes("lotteriesbycreator")) return 45;
   if (q.includes("lotteriesbyfeerecipient")) return 45;
 
@@ -465,7 +459,7 @@ async function sha256Hex(input: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// -------------------- Meta-guard (avoid cache poisoning on force-fresh) --------------------
+// -------------------- Meta-guard --------------------
 
 function metaKeyUrlFrom(reqUrl: string, hashKey: string): Request {
   const u = new URL(reqUrl);
